@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Chessable PGN Exporter & Auto-Downloader (v2.0 with FEN)
+// @name         Chessable PGN Exporter & Auto-Next
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  Export Chessable games to PGN format with FEN support. Automatically downloads when navigating.
+// @version      3.0
+// @description  Export Chessable games to PGN format, downloads, and clicks Next automatically.
 // @author       Aseem Sharan
 // @match        https://www.chessable.com/*
 // @grant        none
@@ -14,21 +14,16 @@
 
     // State variables
     let currentGameData = null;
-    let isAutoDownload = true; // Set to true to automatically download on new network calls
+    let isAutoDownload = true;
 
-    /**
-     * Extract commentary from nested data structure
-     */
+    // --- PGN PARSING LOGIC ---
     function extractCommentary(afterData) {
         if (!afterData || !afterData.data) return "";
-
         const comments = [];
         for (const item of afterData.data) {
             if (!item.val) continue;
-
             const val = item.val;
             const key = item.key || '';
-
             if (typeof val === 'string') {
                 let commentText = val;
                 commentText = commentText.replace(/@@SANStart@@(.*?)@@SANEnd@@/g, '$1');
@@ -43,7 +38,6 @@
                 for (const nestedItem of val) {
                     const itemKey = nestedItem.key || '';
                     const itemVal = nestedItem.val || '';
-
                     if (itemKey === 'C') {
                         let text = itemVal.replace(/@@SANStart@@(.*?)@@SANEnd@@/g, '$1');
                         text = text.replace(/\s+/g, ' ').trim();
@@ -193,6 +187,7 @@
         return pgnContent;
     }
 
+    // --- UI & NOTIFICATIONS ---
     function showNotification(message, type = 'success') {
         const toast = document.createElement('div');
         toast.style.cssText = `
@@ -212,7 +207,6 @@
     function updateButtonStatus(hasData) {
         const button = document.getElementById('chessable-pgn-export-btn');
         if (!button) return;
-
         if (hasData) {
             button.style.backgroundColor = '#4CAF50';
             button.textContent = '📥 Download PGN';
@@ -222,6 +216,18 @@
         }
     }
 
+    // --- AUTO NEXT FUNCTION ---
+    function clickNextPage() {
+        const nextButton = document.getElementById('variation-btn-next-variation');
+        if (nextButton) {
+            showNotification('Moving to Next Variation...', 'warning');
+            setTimeout(() => nextButton.click(), 1000); // 1 sec delay to let download finish
+        } else {
+            console.log("Auto-Next: Button not found.");
+        }
+    }
+
+    // --- DOWNLOAD WORKFLOW ---
     function downloadPGN() {
         if (!currentGameData) {
             showNotification('No game data available.', 'error');
@@ -246,15 +252,18 @@
             URL.revokeObjectURL(url);
 
             showNotification(`✓ Downloaded: ${filename}`, 'success');
+
+            // NEW: Automatically trigger the next page click after a successful download
+            if (isAutoDownload) {
+                setTimeout(clickNextPage, 1000);
+            }
+
         } catch (error) {
             showNotification('Error generating PGN: ' + error.message, 'error');
         }
     }
 
-    // ==========================================
-    // NETWORK INTERCEPTION & AUTO-DOWNLOAD
-    // ==========================================
-
+    // --- NETWORK INTERCEPTION ---
     function handleGameCapture(data) {
         currentGameData = data;
         updateButtonStatus(true);
@@ -267,7 +276,6 @@
         }
     }
 
-    // --- INTERCEPT FETCH ---
     const originalFetch = window.fetch;
     window.fetch = function(...args) {
         return originalFetch.apply(this, args).then(response => {
@@ -283,7 +291,6 @@
         });
     };
 
-    // --- INTERCEPT XHR ---
     const originalOpen = XMLHttpRequest.prototype.open;
     const originalSend = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function(method, url, ...rest) {
@@ -304,53 +311,36 @@
         return originalSend.apply(this, args);
     };
 
-    // ==========================================
-    // UI BUTTONS
-    // ==========================================
-
+    // --- UI INJECTION ---
     function toggleAutoDownload() {
         isAutoDownload = !isAutoDownload;
         const toggleBtn = document.getElementById('chessable-auto-dl-btn');
         if (isAutoDownload) {
-            toggleBtn.textContent = '🔄 Auto-DL: ON';
+            toggleBtn.textContent = '🔄 Auto: ON';
             toggleBtn.style.backgroundColor = '#007bff';
-            showNotification('Auto-Download Enabled', 'success');
+            showNotification('Auto-Download & Next Enabled', 'success');
         } else {
-            toggleBtn.textContent = '🔄 Auto-DL: OFF';
+            toggleBtn.textContent = '🔄 Auto: OFF';
             toggleBtn.style.backgroundColor = '#dc3545';
-            showNotification('Auto-Download Disabled', 'success');
+            showNotification('Auto-Download & Next Disabled', 'success');
         }
     }
 
     function addButtons() {
         if (document.getElementById('chessable-pgn-export-btn')) return;
-
         const container = document.createElement('div');
-        container.style.cssText = `
-            position: fixed; top: 10px; right: 10px; z-index: 10000;
-            display: flex; gap: 10px;
-        `;
+        container.style.cssText = `position: fixed; top: 10px; right: 10px; z-index: 10000; display: flex; gap: 10px;`;
 
         const dlButton = document.createElement('button');
         dlButton.id = 'chessable-pgn-export-btn';
         dlButton.textContent = '📥 No Data';
-        dlButton.style.cssText = `
-            padding: 10px 15px; background-color: #9E9E9E; color: white;
-            border: none; border-radius: 5px; font-size: 14px; font-weight: bold;
-            cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-            transition: background-color 0.3s;
-        `;
+        dlButton.style.cssText = `padding: 10px 15px; background-color: #9E9E9E; color: white; border: none; border-radius: 5px; font-size: 14px; font-weight: bold; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: background-color 0.3s;`;
         dlButton.onclick = downloadPGN;
 
         const toggleBtn = document.createElement('button');
         toggleBtn.id = 'chessable-auto-dl-btn';
-        toggleBtn.textContent = '🔄 Auto-DL: ON';
-        toggleBtn.style.cssText = `
-            padding: 10px 15px; background-color: #007bff; color: white;
-            border: none; border-radius: 5px; font-size: 14px; font-weight: bold;
-            cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-            transition: background-color 0.3s;
-        `;
+        toggleBtn.textContent = '🔄 Auto: ON';
+        toggleBtn.style.cssText = `padding: 10px 15px; background-color: #007bff; color: white; border: none; border-radius: 5px; font-size: 14px; font-weight: bold; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: background-color 0.3s;`;
         toggleBtn.onclick = toggleAutoDownload;
 
         container.appendChild(dlButton);
@@ -358,10 +348,7 @@
         document.body.appendChild(container);
 
         const style = document.createElement('style');
-        style.textContent = `
-            @keyframes slideIn { from { transform: translateX(400px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-            @keyframes slideOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(400px); opacity: 0; } }
-        `;
+        style.textContent = `@keyframes slideIn { from { transform: translateX(400px); opacity: 0; } to { transform: translateX(0); opacity: 1; } } @keyframes slideOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(400px); opacity: 0; } }`;
         document.head.appendChild(style);
     }
 
