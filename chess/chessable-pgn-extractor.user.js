@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         Chessable PGN Exporter (with FEN v2)
+// @name         Chessable PGN Exporter & Auto-Downloader (v2.0 with FEN)
 // @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  Export Chessable games to PGN format with all annotations, commentary, starting FEN, and correct comment placement
-// @author       Your Name
+// @version      2.0
+// @description  Export Chessable games to PGN format with FEN support. Automatically downloads when navigating.
+// @author       Aseem Sharan
 // @match        https://www.chessable.com/*
 // @grant        none
 // @run-at       document-start
@@ -12,15 +12,15 @@
 (function() {
     'use strict';
 
+    // State variables
     let currentGameData = null;
+    let isAutoDownload = true; // Set to true to automatically download on new network calls
 
     /**
      * Extract commentary from nested data structure
      */
     function extractCommentary(afterData) {
-        if (!afterData || !afterData.data) {
-            return "";
-        }
+        if (!afterData || !afterData.data) return "";
 
         const comments = [];
         for (const item of afterData.data) {
@@ -29,31 +29,26 @@
             const val = item.val;
             const key = item.key || '';
 
-            // If val is a string, it's a comment
             if (typeof val === 'string') {
                 let commentText = val;
-                // Clean up Chessable-specific markers
                 commentText = commentText.replace(/@@SANStart@@(.*?)@@SANEnd@@/g, '$1');
                 commentText = commentText.replace(/@@StartBracket@@(.*?)@@EndBracket@@/g, '$1');
-                // Remove HTML tags
                 commentText = commentText.replace(/<br\s*\/?>/g, ' ');
                 commentText = commentText.replace(/<strong>(.*?)<\/strong>/g, '$1');
-                // Clean up extra whitespace
                 commentText = commentText.replace(/\s+/g, ' ').trim();
                 comments.push(commentText);
             }
-            // If val is an array, it contains nested commentary (like variations)
             else if (Array.isArray(val)) {
                 const nestedParts = [];
                 for (const nestedItem of val) {
                     const itemKey = nestedItem.key || '';
                     const itemVal = nestedItem.val || '';
 
-                    if (itemKey === 'C') {  // Comment
+                    if (itemKey === 'C') {
                         let text = itemVal.replace(/@@SANStart@@(.*?)@@SANEnd@@/g, '$1');
                         text = text.replace(/\s+/g, ' ').trim();
                         nestedParts.push(text);
-                    } else if (itemKey === 'S') {  // Chess move
+                    } else if (itemKey === 'S') {
                         nestedParts.push(itemVal);
                     }
                 }
@@ -62,22 +57,16 @@
                 }
             }
         }
-
         return comments.join(' ');
     }
 
-    /**
-     * Extract commentary from 'before' field if it exists
-     */
     function extractBeforeCommentary(move) {
         const beforeField = move.before || '';
         if (beforeField && typeof beforeField === 'string' && beforeField.startsWith('{')) {
             try {
                 const beforeData = JSON.parse(beforeField);
                 return extractCommentary(beforeData);
-            } catch (e) {
-                // Ignore parse errors
-            }
+            } catch (e) {}
         }
         return "";
     }
@@ -94,17 +83,14 @@
     }
 
     /**
-     * Convert game data to PGN format
+     * Convert game data to PGN format (Using v1.3 Token Logic)
      */
     function convertToPGN(gameData) {
         const gameInfo = gameData.game || {};
         const moves = gameInfo.data || [];
 
-        if (moves.length === 0) {
-            throw new Error("No moves found in game data");
-        }
+        if (moves.length === 0) throw new Error("No moves found in game data");
 
-        // Build PGN tokens — each entry is a string fragment that will be joined with spaces
         const tokens = [];
         let moveNum = 1;
         let whiteMove = "";
@@ -127,25 +113,19 @@
                     if (commentText) {
                         afterComment = commentText;
                     }
-                } catch (e) {
-                    // Ignore parse errors
-                }
+                } catch (e) {}
             }
 
             if (col === 'w') {
-                // A comment that appears before white's move belongs BEFORE the move number.
-                // Emit it as a standalone token now, before we emit the move number + move.
                 if (beforeComment) {
                     tokens.push(`{${beforeComment}}`);
                 }
 
                 if (san) {
-                    // Normal white move
                     whiteMove = san;
                     whiteAnnotation = ann1;
                     whiteAfterComment = afterComment ? `{${afterComment}}` : "";
                 } else {
-                    // No move, comment only — already pushed above; nothing more to store
                     whiteMove = "";
                     whiteAnnotation = "";
                     whiteAfterComment = "";
@@ -153,11 +133,8 @@
 
             } else if (col === 'b') {
                 if (whiteMove) {
-                    // Emit the white half of the pair: "N. move[ann] [afterComment]"
                     tokens.push(`${moveNum}. ${whiteMove}${whiteAnnotation}`);
                     if (whiteAfterComment) tokens.push(whiteAfterComment);
-
-                    // Black's before-comment comes after white's after-comment, before black's move
                     if (beforeComment) tokens.push(`{${beforeComment}}`);
 
                     if (san) {
@@ -170,8 +147,6 @@
                     whiteAnnotation = "";
                     whiteAfterComment = "";
                 } else {
-                    // White had no move (comment-only white slot) — black starts the move pair
-                    // In this case the move number needs an ellipsis for black
                     if (beforeComment) tokens.push(`{${beforeComment}}`);
                     if (san) {
                         tokens.push(`${moveNum}... ${san}${ann1}`);
@@ -182,39 +157,21 @@
             }
         }
 
-        // Handle case where last move is white
         if (whiteMove) {
             tokens.push(`${moveNum}. ${whiteMove}${whiteAnnotation}`);
             if (whiteAfterComment) tokens.push(whiteAfterComment);
         }
 
-        // Get additional game info
         const gameName = gameInfo.name || 'Chessable Course';
         const openingName = gameInfo.openName || '';
         const lineName = gameInfo.lineName || '';
         const title = gameInfo.title || '';
         const result = gameInfo.result || '*';
-        const color = gameInfo.color || '';
+        const startingFen = gameInfo.initial || null;
 
-        // Determine player colors
-        let whitePlayer = "?";
-        let blackPlayer = "?";
-        if (color === 'w') {
-            whitePlayer = "Student";
-            blackPlayer = "Opponent";
-        } else if (color === 'b') {
-            whitePlayer = "Opponent";
-            blackPlayer = "Student";
-        }
-
-        // Get current date
         const today = new Date();
         const dateStr = `${today.getFullYear()}.${String(today.getMonth() + 1).padStart(2, '0')}.${String(today.getDate()).padStart(2, '0')}`;
 
-        // Get starting FEN position
-        const startingFen = gameInfo.initial || null;
-
-        // Create PGN headers
         let pgnContent = `[Event "${gameName}"]\n`;
         pgnContent += `[Site "Chessable.com"]\n`;
         pgnContent += `[Date "${dateStr}"]\n`;
@@ -223,72 +180,35 @@
         pgnContent += `[Black "${title}"]\n`;
         pgnContent += `[Result "${result}"]\n`;
         pgnContent += `[Opening "${openingName}"]\n`;
-        //pgnContent += `[Variation "${lineName} - ${title}"]\n`;
 
-        // Add FEN tag only when the starting position is not the standard one
         if (startingFen && !isStandardStartPosition(startingFen)) {
             pgnContent += `[FEN "${startingFen}"]\n`;
             pgnContent += `[SetUp "1"]\n`;
         }
 
         pgnContent += `\n`;
-
-        // Join all tokens with spaces and append result
         pgnContent += tokens.join(' ') + '\n';
         pgnContent += `${result}\n`;
 
         return pgnContent;
     }
 
-    /**
-     * Show notification toast
-     */
     function showNotification(message, type = 'success') {
         const toast = document.createElement('div');
         toast.style.cssText = `
-            position: fixed;
-            top: 70px;
-            right: 10px;
-            z-index: 10001;
-            padding: 12px 20px;
+            position: fixed; top: 70px; right: 10px; z-index: 10001; padding: 12px 20px;
             background-color: ${type === 'success' ? '#4CAF50' : type === 'error' ? '#f44336' : '#ff9800'};
-            color: white;
-            border-radius: 5px;
-            font-size: 14px;
-            font-weight: bold;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.3);
-            animation: slideIn 0.3s ease-out;
+            color: white; border-radius: 5px; font-size: 14px; font-weight: bold;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.3); animation: slideIn 0.3s ease-out;
         `;
         toast.textContent = message;
-
-        // Add animation
-        const style = document.createElement('style');
-        style.textContent = `
-            @keyframes slideIn {
-                from { transform: translateX(400px); opacity: 0; }
-                to { transform: translateX(0); opacity: 1; }
-            }
-            @keyframes slideOut {
-                from { transform: translateX(0); opacity: 1; }
-                to { transform: translateX(400px); opacity: 0; }
-            }
-        `;
-        document.head.appendChild(style);
-
         document.body.appendChild(toast);
-
-        // Remove after 3 seconds
         setTimeout(() => {
-            toast.style.animation = 'slideOut 0.3s ease-in';
-            setTimeout(() => {
-                document.body.removeChild(toast);
-            }, 300);
+            toast.style.animation = 'slideOut 0.3s ease-in forwards';
+            setTimeout(() => document.body.removeChild(toast), 300);
         }, 3000);
     }
 
-    /**
-     * Update button status
-     */
     function updateButtonStatus(hasData) {
         const button = document.getElementById('chessable-pgn-export-btn');
         if (!button) return;
@@ -296,40 +216,25 @@
         if (hasData) {
             button.style.backgroundColor = '#4CAF50';
             button.textContent = '📥 Download PGN';
-            button.title = 'Click to download the current position as PGN';
         } else {
             button.style.backgroundColor = '#9E9E9E';
             button.textContent = '📥 No Data';
-            button.title = 'Navigate to a game position first';
         }
     }
 
-    /**
-     * Download PGN file
-     */
     function downloadPGN() {
         if (!currentGameData) {
-            showNotification('No game data available. Navigate to a position first.', 'error');
+            showNotification('No game data available.', 'error');
             return;
         }
 
         try {
-            const button = document.getElementById('chessable-pgn-export-btn');
-            if (button) {
-                button.textContent = '⏳ Generating...';
-            }
-
             const pgn = convertToPGN(currentGameData);
-
-            // Create filename from game info
             const gameInfo = currentGameData.game || {};
             const lineName = gameInfo.lineName || 'game';
             const title = gameInfo.title || 'game';
-            //const filename = lineName.replace(/[^a-z0-9]/gi, '_').toLowerCase() + '.pgn';
             const filename = lineName + ' - ' + title + '.pgn';
-            //const filename = title + '.pgn';
 
-            // Create blob and download
             const blob = new Blob([pgn], { type: 'text/plain' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -340,132 +245,135 @@
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
 
-            console.log("PGN downloaded successfully!");
             showNotification(`✓ Downloaded: ${filename}`, 'success');
-
-            if (button) {
-                button.textContent = '📥 Download PGN';
-            }
         } catch (error) {
             showNotification('Error generating PGN: ' + error.message, 'error');
-            console.error("Error generating PGN:", error);
-
-            const button = document.getElementById('chessable-pgn-export-btn');
-            if (button) {
-                button.textContent = '📥 Download PGN';
-            }
         }
     }
 
-    /**
-     * Intercept fetch requests to capture game data
-     */
+    // ==========================================
+    // NETWORK INTERCEPTION & AUTO-DOWNLOAD
+    // ==========================================
+
+    function handleGameCapture(data) {
+        currentGameData = data;
+        updateButtonStatus(true);
+
+        if (isAutoDownload) {
+            console.log("Chessable PGN Exporter: New game detected, auto-downloading...");
+            setTimeout(downloadPGN, 500);
+        } else {
+            showNotification('Game data captured! Click button to download.', 'success');
+        }
+    }
+
+    // --- INTERCEPT FETCH ---
     const originalFetch = window.fetch;
     window.fetch = function(...args) {
         return originalFetch.apply(this, args).then(response => {
             const clonedResponse = response.clone();
-
             const url = args[0];
-            if (typeof url === 'string' && url.includes('/api/v1/getGame')) {
-                clonedResponse.json().then(data => {
-                    console.log("Captured Chessable game data");
-                    currentGameData = data;
-                    updateButtonStatus(true);
-                    showNotification('Game data captured! Click button to download.', 'success');
-                }).catch(err => {
-                    console.error("Error parsing game data:", err);
-                });
-            }
 
+            if (typeof url === 'string' && url.includes('/api/v1/getGame')) {
+                clonedResponse.json()
+                    .then(data => handleGameCapture(data))
+                    .catch(err => console.error("Error parsing fetch:", err));
+            }
             return response;
         });
     };
 
-    /**
-     * Intercept XMLHttpRequest to capture game data
-     */
+    // --- INTERCEPT XHR ---
     const originalOpen = XMLHttpRequest.prototype.open;
     const originalSend = XMLHttpRequest.prototype.send;
-
     XMLHttpRequest.prototype.open = function(method, url, ...rest) {
         this._url = url;
         return originalOpen.apply(this, [method, url, ...rest]);
     };
-
     XMLHttpRequest.prototype.send = function(...args) {
         this.addEventListener('load', function() {
             if (this._url && this._url.includes('/api/v1/getGame')) {
                 try {
                     const data = JSON.parse(this.responseText);
-                    console.log("Captured Chessable game data (XHR)");
-                    currentGameData = data;
-                    updateButtonStatus(true);
-                    showNotification('Game data captured! Click button to download.', 'success');
+                    handleGameCapture(data);
                 } catch (e) {
-                    console.error("Error parsing game data:", e);
+                    console.error("Error parsing XHR:", e);
                 }
             }
         });
         return originalSend.apply(this, args);
     };
 
-    /**
-     * Add download button to the page
-     */
-    function addDownloadButton() {
-        if (document.getElementById('chessable-pgn-export-btn')) {
-            return;
+    // ==========================================
+    // UI BUTTONS
+    // ==========================================
+
+    function toggleAutoDownload() {
+        isAutoDownload = !isAutoDownload;
+        const toggleBtn = document.getElementById('chessable-auto-dl-btn');
+        if (isAutoDownload) {
+            toggleBtn.textContent = '🔄 Auto-DL: ON';
+            toggleBtn.style.backgroundColor = '#007bff';
+            showNotification('Auto-Download Enabled', 'success');
+        } else {
+            toggleBtn.textContent = '🔄 Auto-DL: OFF';
+            toggleBtn.style.backgroundColor = '#dc3545';
+            showNotification('Auto-Download Disabled', 'success');
         }
-
-        const button = document.createElement('button');
-        button.id = 'chessable-pgn-export-btn';
-        button.textContent = '📥 Download PGN';
-        button.style.cssText = `
-            position: fixed;
-            top: 10px;
-            right: 10px;
-            z-index: 10000;
-            padding: 10px 15px;
-            background-color: #4CAF50;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            font-size: 14px;
-            font-weight: bold;
-            cursor: pointer;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
-            transition: background-color 0.3s;
-        `;
-
-        button.onmouseover = function() {
-            this.style.backgroundColor = '#45a049';
-        };
-
-        button.onmouseout = function() {
-            this.style.backgroundColor = '#4CAF50';
-        };
-
-        button.onclick = downloadPGN;
-
-        document.body.appendChild(button);
-        console.log("Chessable PGN Exporter: Download button added");
     }
 
-    /**
-     * Initialize the script
-     */
+    function addButtons() {
+        if (document.getElementById('chessable-pgn-export-btn')) return;
+
+        const container = document.createElement('div');
+        container.style.cssText = `
+            position: fixed; top: 10px; right: 10px; z-index: 10000;
+            display: flex; gap: 10px;
+        `;
+
+        const dlButton = document.createElement('button');
+        dlButton.id = 'chessable-pgn-export-btn';
+        dlButton.textContent = '📥 No Data';
+        dlButton.style.cssText = `
+            padding: 10px 15px; background-color: #9E9E9E; color: white;
+            border: none; border-radius: 5px; font-size: 14px; font-weight: bold;
+            cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            transition: background-color 0.3s;
+        `;
+        dlButton.onclick = downloadPGN;
+
+        const toggleBtn = document.createElement('button');
+        toggleBtn.id = 'chessable-auto-dl-btn';
+        toggleBtn.textContent = '🔄 Auto-DL: ON';
+        toggleBtn.style.cssText = `
+            padding: 10px 15px; background-color: #007bff; color: white;
+            border: none; border-radius: 5px; font-size: 14px; font-weight: bold;
+            cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            transition: background-color 0.3s;
+        `;
+        toggleBtn.onclick = toggleAutoDownload;
+
+        container.appendChild(dlButton);
+        container.appendChild(toggleBtn);
+        document.body.appendChild(container);
+
+        const style = document.createElement('style');
+        style.textContent = `
+            @keyframes slideIn { from { transform: translateX(400px); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+            @keyframes slideOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(400px); opacity: 0; } }
+        `;
+        document.head.appendChild(style);
+    }
+
     function init() {
         if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', addDownloadButton);
+            document.addEventListener('DOMContentLoaded', addButtons);
         } else {
-            addDownloadButton();
+            addButtons();
         }
-
-        setTimeout(addDownloadButton, 2000);
-        setTimeout(addDownloadButton, 5000);
+        setTimeout(addButtons, 2000);
+        setTimeout(addButtons, 5000);
     }
 
     init();
-
-    console.log("Chessable PGN Exporter loaded successfully!");
 })();
