@@ -1,8 +1,9 @@
 // ==UserScript==
 // @name         ChessNeurons Puzzle PGN Decryptor
 // @namespace    chessneurons-pgn-decryptor
-// @version      1.0
-// @description  Passively captures ChessNeurons' own puzzle fetches (easy + hard), decrypts their PGNs, and shows them in an overlay panel.
+// @version      1.1
+// @description  Passively captures ChessNeurons' puzzle fetches (daily batches and individual history), decrypts their PGNs, and shows them in an overlay panel.
+// @author       Aseem Sharan
 // @match        https://chessneurons.com/*
 // @grant        GM_addStyle
 // @grant        unsafeWindow
@@ -18,7 +19,7 @@
 
   LOG('script top-level execution started, readyState =', document.readyState);
 
-  // ---- Decryption (port of decrypt_puzzles_grouped.py) ----
+  // ---- Decryption (unchanged from the original script) ----
 
   function base64ToBytes(b64) {
     const binary = atob(b64);
@@ -57,105 +58,359 @@
     }
   }
 
-  // ---- Networking ----
-  // No active fetch: this script only listens passively to the page's own
-  // fetchpuzzles calls and decrypts whatever it observes.
+  // ---- Passive networking capture ----
+  // This script never sends a fetch/XHR of its own. It only observes requests
+  // that the ChessNeurons page itself makes.
+  //
+  // Daily fetchpuzzles calls contain the ID in each response puzzle.
+  // Individual /puzzle calls contain the ID in the outgoing request body, while
+  // the response puzzle.id is blank. We restore that request ID before decrypting.
 
-  // ---- Passive interception of the page's own fetchpuzzles calls ----
-  // Captures puzzles the page already fetched for its own board rendering,
-  // so we don't fire redundant network requests when the page loads them itself.
-  const capturedPuzzles = { EASY: null, HARD: null };
+  const capturedPuzzles = {
+    EASY: null,
+    HARD: null,
+    OPENED: []
+  };
+
   const captureListeners = [];
 
   function notifyCapture() {
     captureListeners.forEach((cb) => cb());
   }
 
-  function tryCapture(requestBody, responseText) {
+  function getCaptureKind(url) {
+    if (!url) return null;
+
+    let pathname;
+    try {
+      pathname = new URL(String(url), window.location.href).pathname;
+    } catch (e) {
+      pathname = String(url).split('?')[0];
+    }
+
+    const normalized = pathname.replace(/\/+$/, '').toLowerCase();
+    if (normalized.endsWith('/api/playersapi/fetchpuzzles')) return 'FETCH_PUZZLES';
+    if (normalized.endsWith('/api/playersapi/puzzle')) return 'SINGLE_PUZZLE';
+    return null;
+  }
+
+  function getRequestUrl(input) {
+    return typeof input === 'string' ? input : (input && input.url);
+  }
+
+  function readFetchRequestBody(input, init) {
+    if (init && init.body != null) {
+      if (typeof init.body === 'string') return Promise.resolve(init.body);
+      if (typeof init.body.text === 'function') {
+        return init.body.text().catch(() => String(init.body));
+      }
+      return Promise.resolve(String(init.body));
+    }
+
+    if (input && typeof input !== 'string' && typeof input.clone === 'function') {
+      try {
+        return input.clone().text().catch(() => '');
+      } catch (e) {
+        return Promise.resolve('');
+      }
+    }
+
+    return Promise.resolve('');
+  }
+
+  function resolvePuzzleDifficultyType(puzzle) {
+    // This is the same Easy/Hard split used by the ChessNeurons frontend.
+    const difficulty = Number(puzzle && puzzle.difficulty);
+    if (Number.isFinite(difficulty)) {
+      return difficulty < 1600 ? 'EASY' : 'HARD';
+    }
+
+    // Fallback only for malformed/missing difficulty values.
+    const puzzleNumber = Number.parseInt(puzzle && puzzle.name, 10);
+    return Number.isFinite(puzzleNumber) && puzzleNumber >= 6 ? 'HARD' : 'EASY';
+  }
+
+  function storeOpenedPuzzle(puzzle) {
+    const existingIndex = capturedPuzzles.OPENED.findIndex(
+      (item) => item.id === puzzle.id && item.activeDate === puzzle.activeDate
+    );
+
+    if (existingIndex === -1) {
+      capturedPuzzles.OPENED.push(puzzle);
+      LOG(`storeOpenedPuzzle: added #${puzzle.name || '?'} (${puzzle.id})`);
+    } else {
+      capturedPuzzles.OPENED[existingIndex] = puzzle;
+      LOG(`storeOpenedPuzzle: refreshed existing #${puzzle.name || '?'} (${puzzle.id})`);
+    }
+  }
+
+  function tryCaptureFetchPuzzles(requestBody, responseText) {
     try {
       const reqJson = JSON.parse(requestBody);
       const difficultyType = reqJson && reqJson.difficultyType;
       if (difficultyType !== 'EASY' && difficultyType !== 'HARD') {
-        LOG('tryCapture: not a fetchpuzzles EASY/HARD request body, ignoring');
+        LOG('tryCaptureFetchPuzzles: request body is not EASY/HARD, ignoring');
         return;
       }
 
       const resJson = JSON.parse(responseText);
       if (!resJson || !Array.isArray(resJson.Puzzles)) {
-        LOG('tryCapture: response JSON missing Puzzles array, ignoring', resJson);
+        LOG('tryCaptureFetchPuzzles: response JSON missing Puzzles array, ignoring', resJson);
         return;
       }
 
       capturedPuzzles[difficultyType] = resJson.Puzzles;
-      LOG(`tryCapture: captured ${resJson.Puzzles.length} ${difficultyType} puzzles from page's own request`);
+      LOG(`tryCaptureFetchPuzzles: captured ${resJson.Puzzles.length} ${difficultyType} puzzles`);
       notifyCapture();
     } catch (e) {
-      LOG('tryCapture: not JSON or unexpected shape, ignoring', e);
+      LOG('tryCaptureFetchPuzzles: not JSON or unexpected shape, ignoring', e);
+    }
+  }
+
+  function tryCaptureSinglePuzzle(requestBody, responseText) {
+    try {
+      const reqJson = JSON.parse(requestBody);
+      const puzzleId = reqJson && reqJson.id;
+      if (typeof puzzleId !== 'string' || !puzzleId) {
+        LOG('tryCaptureSinglePuzzle: request body missing id, ignoring');
+        return;
+      }
+
+      const resJson = JSON.parse(responseText);
+      const responsePuzzle = resJson && resJson.puzzle;
+      if (!responsePuzzle || !responsePuzzle.pgn || !responsePuzzle.activeDate) {
+        LOG('tryCaptureSinglePuzzle: response JSON missing puzzle/pgn/activeDate, ignoring', resJson);
+        return;
+      }
+
+      // The /puzzle response intentionally returns id: "". The page itself
+      // decrypts with the original request argument; do the same here.
+      const puzzle = {
+        ...responsePuzzle,
+        id: puzzleId,
+        _difficultyType: resolvePuzzleDifficultyType(responsePuzzle),
+        _captureSource: 'SINGLE_PUZZLE'
+      };
+
+      storeOpenedPuzzle(puzzle);
+      LOG(`tryCaptureSinglePuzzle: passively captured #${puzzle.name || '?'} (${puzzleId})`);
+      notifyCapture();
+    } catch (e) {
+      LOG('tryCaptureSinglePuzzle: not JSON or unexpected shape, ignoring', e);
+    }
+  }
+
+  function handleCapturedResponse(kind, requestBody, responseText) {
+    if (kind === 'FETCH_PUZZLES') {
+      tryCaptureFetchPuzzles(requestBody, responseText);
+    } else if (kind === 'SINGLE_PUZZLE') {
+      tryCaptureSinglePuzzle(requestBody, responseText);
     }
   }
 
   function installInterceptors() {
     // Tampermonkey runs userscripts in a sandboxed context whose `window` is
-    // NOT the page's real window in default/sandboxed injection modes.
-    // Patching bare `window.fetch` there only patches our sandbox's copy —
-    // the page's own bundled JS keeps calling the real, unpatched fetch, so
-    // we'd never observe its calls. `unsafeWindow` is Tampermonkey/Greasemonkey's
-    // explicit handle to the actual page window; fall back to `window` for
-    // engines that don't sandbox (e.g. some Greasemonkey/Violentmonkey modes
-    // where window already *is* the page window and unsafeWindow is undefined).
+    // not necessarily the page's real window. unsafeWindow gives access to the
+    // window used by ChessNeurons' bundled frontend.
     const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-    LOG('installInterceptors: patching fetch and XMLHttpRequest on', typeof unsafeWindow !== 'undefined' ? 'unsafeWindow (page window)' : 'window (no unsafeWindow available)');
+    LOG(
+      'installInterceptors: patching fetch and XMLHttpRequest on',
+      typeof unsafeWindow !== 'undefined' ? 'unsafeWindow (page window)' : 'window'
+    );
 
-    // Patch fetch
+    // Patch fetch passively.
     const originalFetch = pageWindow.fetch;
-    pageWindow.fetch = function (input, init) {
-      const url = typeof input === 'string' ? input : (input && input.url);
-      const isTarget = url && url.indexOf('fetchpuzzles') !== -1;
-      if (isTarget) LOG('fetch() intercepted call to fetchpuzzles:', url);
-      const promise = originalFetch.apply(this, arguments);
-      if (isTarget) {
-        promise
-          .then((res) => res.clone().text().then((text) => {
-            const body = (init && init.body) || '';
-            tryCapture(body, text);
-          }))
-          .catch((e) => LOG('fetch interceptor: error reading response clone', e));
-      }
-      return promise;
-    };
+    if (typeof originalFetch === 'function') {
+      pageWindow.fetch = function (input, init) {
+        const url = getRequestUrl(input);
+        const kind = getCaptureKind(url);
+        const requestBodyPromise = kind ? readFetchRequestBody(input, init) : null;
 
-    // Patch XMLHttpRequest
+        if (kind) LOG(`fetch() intercepted ${kind}:`, url);
+
+        // This is the page's original request. No extra request is sent.
+        const promise = originalFetch.apply(this, arguments);
+
+        if (kind) {
+          promise
+            .then((res) => Promise.all([
+              requestBodyPromise,
+              res.clone().text()
+            ]))
+            .then(([requestBody, responseText]) => {
+              handleCapturedResponse(kind, requestBody || '', responseText);
+            })
+            .catch((e) => LOG('fetch interceptor: error reading captured request/response', e));
+        }
+
+        return promise;
+      };
+    }
+
+    // Patch XMLHttpRequest as a fallback, also passively.
     const OriginalXHR = pageWindow.XMLHttpRequest;
-    const originalOpen = OriginalXHR.prototype.open;
-    const originalSend = OriginalXHR.prototype.send;
+    if (OriginalXHR && OriginalXHR.prototype) {
+      const originalOpen = OriginalXHR.prototype.open;
+      const originalSend = OriginalXHR.prototype.send;
 
-    OriginalXHR.prototype.open = function (method, url) {
-      this._cnIsTarget = typeof url === 'string' && url.indexOf('fetchpuzzles') !== -1;
-      if (this._cnIsTarget) LOG('XHR.open() intercepted call to fetchpuzzles:', url);
-      return originalOpen.apply(this, arguments);
-    };
+      OriginalXHR.prototype.open = function (method, url) {
+        this._cnCaptureKind = getCaptureKind(url);
+        this._cnCaptureUrl = url;
+        if (this._cnCaptureKind) {
+          LOG(`XHR.open() intercepted ${this._cnCaptureKind}:`, url);
+        }
+        return originalOpen.apply(this, arguments);
+      };
 
-    OriginalXHR.prototype.send = function (body) {
-      if (this._cnIsTarget) {
-        this.addEventListener('load', () => {
-          tryCapture(body || '', this.responseText);
-        });
-      }
-      return originalSend.apply(this, arguments);
-    };
+      OriginalXHR.prototype.send = function (body) {
+        const kind = this._cnCaptureKind;
+        if (kind) {
+          this.addEventListener('load', () => {
+            handleCapturedResponse(kind, body || '', this.responseText);
+          });
+        }
+        return originalSend.apply(this, arguments);
+      };
+    }
 
     LOG('installInterceptors: done, fetch/XHR patched successfully');
   }
 
-  // Install as early as possible so we don't miss the page's initial calls.
-  // Wrapped so a sandbox/CSP quirk here can't silently abort the whole
-  // script and prevent the toggle button from ever being created below.
+  // Install as early as possible so the page's initial calls are not missed.
   try {
     installInterceptors();
   } catch (e) {
     LOG_ERR('installInterceptors failed — network capture disabled, but continuing:', e);
   }
 
+  // ---- PGN formatting ----
+
+  // Lichess studies only recognize standard PGN tags — [ChapterName "..."]
+  // drives the sidebar chapter title, [Event] is shown as game info, and
+  // WhiteElo/BlackElo render as a rating badge — so puzzle metadata is folded
+  // into those fields exactly as in the original script.
+  function setPgnTag(pgnText, tagName, value) {
+    const escaped = String(value).replace(/"/g, '\\"');
+    const tagRe = new RegExp(`\\[${tagName}\\s+"[^"]*"\\]`);
+    if (tagRe.test(pgnText)) {
+      return pgnText.replace(tagRe, `[${tagName} "${escaped}"]`);
+    }
+
+    const newTag = `[${tagName} "${escaped}"]`;
+    const lastTagEnd = pgnText.lastIndexOf(']');
+    if (lastTagEnd === -1) {
+      return `${newTag} ${pgnText}`;
+    }
+    return `${pgnText.slice(0, lastTagEnd + 1)} ${newTag}${pgnText.slice(lastTagEnd + 1)}`;
+  }
+
+  function addPuzzleTags(pgnText, puzzle, difficultyType) {
+    const dateOnly = (puzzle.activeDate || '').slice(0, 10);
+    const chapterName = `${dateOnly} #${puzzle.name}`;
+    const themeSuffix = puzzle.tags && puzzle.tags.length
+      ? ` - ${puzzle.tags.join(', ')}`
+      : '';
+    const eventName = `${difficultyType === 'HARD' ? 'Hard' : 'Easy'}${themeSuffix}`;
+
+    let result = pgnText;
+    result = setPgnTag(result, 'ChapterName', chapterName);
+    result = setPgnTag(result, 'Event', eventName);
+    result = setPgnTag(result, 'WhiteElo', puzzle.difficulty);
+    result = setPgnTag(result, 'BlackElo', puzzle.difficulty);
+    return result;
+  }
+
+  // The compact individual /puzzle payload replaces some descriptive source
+  // tags with "?". These two fields are recoverable from data already present
+  // in that same passive response, so restore them before running the original
+  // addPuzzleTags() pipeline.
+  function inferWhiteTopic(puzzle) {
+    if (!puzzle || !Array.isArray(puzzle.tags) || !puzzle.tags.length) return '';
+
+    const topic = String(puzzle.tags[0]);
+
+    // The richer fetchpuzzles PGNs use this singular spelling even though the
+    // API topic is plural. Preserve that known source convention.
+    if (topic === 'Passed Pawns') return 'Passed Pawn';
+
+    return topic;
+  }
+
+  function inferBlackLevel(puzzle) {
+    // Values observed in ChessNeurons' richer fetchpuzzles PGNs. Only fill a
+    // value when the difficulty is one of the known levels; otherwise preserve
+    // the source "?" rather than inventing data.
+    const levelByDifficulty = new Map([
+      [1300, '1'],
+      [1301, '1'],
+      [1400, '1.5'],
+      [1401, '1.5'],
+      [1402, '1.5'],
+      [1650, '2'],
+      [1651, '2'],
+      [1652, '2.5'],
+      [1700, '2.5'],
+      [1701, '3']
+    ]);
+
+    return levelByDifficulty.get(Number(puzzle && puzzle.difficulty)) || '';
+  }
+
+  function restoreRecoverableSinglePuzzleTags(pgnText, puzzle) {
+    if (!puzzle || puzzle._captureSource !== 'SINGLE_PUZZLE') return pgnText;
+
+    let result = pgnText;
+
+    const whiteTopic = inferWhiteTopic(puzzle);
+    if (whiteTopic && /\[White\s+"(?:\?|)"\]/.test(result)) {
+      result = setPgnTag(result, 'White', whiteTopic);
+    }
+
+    const blackLevel = inferBlackLevel(puzzle);
+    if (blackLevel && /\[Black\s+"(?:\?|)"\]/.test(result)) {
+      result = setPgnTag(result, 'Black', blackLevel);
+    }
+
+    return result;
+  }
+
+  // Reformats a single-line "[Tag \"v\"] [Tag \"v\"] ... 1. e4 e5 *" PGN into
+  // the conventional layout: one tag pair per line, a blank line, then movetext.
+  function prettyPrintPgn(pgnText) {
+    const tagRe = /\[[A-Za-z0-9_]+\s+"(?:[^"\\]|\\.)*"\]/g;
+    const tags = pgnText.match(tagRe) || [];
+    const movetext = pgnText.replace(tagRe, '').trim();
+    return tags.join('\n') + (movetext ? `\n\n${movetext}` : '');
+  }
+
+  function formatPuzzlePgn(puzzle, difficultyType) {
+    let decrypted = decryptPuzzle(puzzle.id, puzzle.activeDate, puzzle.pgn);
+    decrypted = restoreRecoverableSinglePuzzleTags(decrypted, puzzle);
+    return prettyPrintPgn(addPuzzleTags(decrypted, puzzle, difficultyType));
+  }
+
+  function puzzlesToPgn(list, difficultyType) {
+    const sortByName = (a, b) => parseInt(a.name, 10) - parseInt(b.name, 10);
+    const sorted = [...list].sort(sortByName);
+    return sorted
+      .map((p) => formatPuzzlePgn(p, difficultyType))
+      .join('\n\n\n');
+  }
+
+  function openedPuzzlesToPgn(list) {
+    return [...list]
+      .map((p) => formatPuzzlePgn(
+        p,
+        p._difficultyType || resolvePuzzleDifficultyType(p)
+      ))
+      .join('\n\n\n');
+  }
+
+  function sectionToPgn(key, list) {
+    return key === 'OPENED'
+      ? openedPuzzlesToPgn(list)
+      : puzzlesToPgn(list, key);
+  }
 
   // ---- UI ----
 
@@ -295,24 +550,36 @@
     }
   }
 
-  function renderPuzzle(puzzle) {
-    const decrypted = decryptPuzzle(puzzle.id, puzzle.activeDate, puzzle.pgn);
+  function escapeHtml(value) {
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function renderPuzzle(puzzle, difficultyType) {
+    const finalPgn = formatPuzzlePgn(
+      puzzle,
+      difficultyType || puzzle._difficultyType || resolvePuzzleDifficultyType(puzzle)
+    );
     const tags = (puzzle.tags || []).join(', ');
+
     return `
       <div class="cn-puzzle-block">
-        <div class="cn-puzzle-title">#${puzzle.name} (difficulty ${puzzle.difficulty}) — ${puzzle.fen || ''}</div>
-        <div class="cn-puzzle-tags">${tags}</div>
-        <div class="cn-pgn-text">${decrypted.replace(/</g, '&lt;')}</div>
+        <div class="cn-puzzle-title">#${escapeHtml(puzzle.name)} (difficulty ${escapeHtml(puzzle.difficulty)}) — ${escapeHtml(puzzle.fen || '')}</div>
+        <div class="cn-puzzle-tags">${escapeHtml(tags)}</div>
+        <div class="cn-pgn-text">${escapeHtml(finalPgn)}</div>
       </div>
     `;
   }
 
-  function renderPuzzleSections(easyList, hardList, collapsedState) {
+  function renderPuzzleSections(easyList, hardList, openedList, collapsedState) {
     const sortByName = (a, b) => parseInt(a.name, 10) - parseInt(b.name, 10);
     const easy = [...easyList].sort(sortByName);
     const hard = [...hardList].sort(sortByName);
+    const opened = [...openedList];
 
-    const header = (title, key, list) => `
+    const section = (title, key, list, difficultyType) => `
       <div class="cn-section-title">
         <span class="cn-section-toggle" data-toggle-key="${key}">
           <span class="cn-caret">${collapsedState[key] ? '▸' : '▾'}</span> ${title} (${list.length})
@@ -322,70 +589,18 @@
           <button class="cn-download-btn" data-key="${key}" ${list.length ? '' : 'disabled'}>Download</button>
         </span>
       </div>
-    `;
-
-    const body = (key, list) => `
       <div class="cn-section-body" data-body-key="${key}" ${collapsedState[key] ? 'style="display:none"' : ''}>
-        ${list.length ? list.map(renderPuzzle).join('') : '<div class="cn-puzzle-tags">Not captured yet.</div>'}
+        ${list.length
+          ? list.map((p) => renderPuzzle(p, difficultyType)).join('')
+          : '<div class="cn-puzzle-tags">Not captured yet.</div>'}
       </div>
     `;
 
     return (
-      header('EASY', 'EASY', easy) +
-      header('HARD', 'HARD', hard) +
-      body('EASY', easy) +
-      body('HARD', hard)
+      section('EASY', 'EASY', easy, 'EASY') +
+      section('HARD', 'HARD', hard, 'HARD') +
+      section('OPENED / HISTORY', 'OPENED', opened, null)
     );
-  }
-
-  // Lichess studies only recognize standard PGN tags — [ChapterName "..."]
-  // drives the sidebar chapter title, [Event] is shown as game info, and
-  // WhiteElo/BlackElo render as a rating badge — so puzzle metadata is
-  // folded into those rather than custom tags Lichess would drop on import.
-  function setPgnTag(pgnText, tagName, value) {
-    const escaped = String(value).replace(/"/g, '\\"');
-    const tagRe = new RegExp(`\\[${tagName}\\s+"[^"]*"\\]`);
-    if (tagRe.test(pgnText)) {
-      return pgnText.replace(tagRe, `[${tagName} "${escaped}"]`);
-    }
-    const newTag = `[${tagName} "${escaped}"]`;
-    const lastTagEnd = pgnText.lastIndexOf(']');
-    if (lastTagEnd === -1) {
-      return `${newTag} ${pgnText}`;
-    }
-    return `${pgnText.slice(0, lastTagEnd + 1)} ${newTag}${pgnText.slice(lastTagEnd + 1)}`;
-  }
-
-  function addPuzzleTags(pgnText, puzzle, difficultyType) {
-    const dateOnly = (puzzle.activeDate || '').slice(0, 10);
-    const chapterName = `${dateOnly} #${puzzle.name}`;
-    const themeSuffix = puzzle.tags && puzzle.tags.length ? ` - ${puzzle.tags.join(', ')}` : '';
-    const eventName = `${difficultyType === 'HARD' ? 'Hard' : 'Easy'}${themeSuffix}`;
-
-    let result = pgnText;
-    result = setPgnTag(result, 'ChapterName', chapterName);
-    result = setPgnTag(result, 'Event', eventName);
-    result = setPgnTag(result, 'WhiteElo', puzzle.difficulty);
-    result = setPgnTag(result, 'BlackElo', puzzle.difficulty);
-    return result;
-  }
-
-  // Reformats a single-line "[Tag "v"] [Tag "v"] ... 1. e4 e5 *" PGN into the
-  // conventional pretty-printed layout: one tag pair per line, a blank line,
-  // then the movetext — purely cosmetic, doesn't change PGN validity.
-  function prettyPrintPgn(pgnText) {
-    const tagRe = /\[[A-Za-z0-9_]+\s+"(?:[^"\\]|\\.)*"\]/g;
-    const tags = pgnText.match(tagRe) || [];
-    const movetext = pgnText.replace(tagRe, '').trim();
-    return tags.join('\n') + (movetext ? `\n\n${movetext}` : '');
-  }
-
-  function puzzlesToPgn(list, difficultyType) {
-    const sortByName = (a, b) => parseInt(a.name, 10) - parseInt(b.name, 10);
-    const sorted = [...list].sort(sortByName);
-    return sorted
-      .map((p) => prettyPrintPgn(addPuzzleTags(decryptPuzzle(p.id, p.activeDate, p.pgn), p, difficultyType)))
-      .join('\n\n\n');
   }
 
   function downloadText(filename, text) {
@@ -398,39 +613,61 @@
     URL.revokeObjectURL(url);
   }
 
-  const sectionCollapsed = { EASY: true, HARD: true };
+  const sectionCollapsed = {
+    EASY: true,
+    HARD: true,
+    OPENED: false
+  };
 
   function renderPanelBody(body) {
     const easy = capturedPuzzles.EASY;
     const hard = capturedPuzzles.HARD;
+    const opened = capturedPuzzles.OPENED;
+
     const haveEasy = Array.isArray(easy);
     const haveHard = Array.isArray(hard);
+    const haveOpened = opened.length > 0;
 
     let statusHtml;
-    if (haveEasy && haveHard) {
-      statusHtml = '<div class="cn-status-line cn-status-ok">Captured from the page\'s own request.</div>';
+    if (haveEasy || haveHard || haveOpened) {
+      const parts = [];
+      if (haveEasy) parts.push(`${easy.length} Easy`);
+      if (haveHard) parts.push(`${hard.length} Hard`);
+      if (haveOpened) parts.push(`${opened.length} opened/history`);
+      statusHtml = `<div class="cn-status-line cn-status-ok">Passively captured ${parts.join(', ')} puzzle${parts.length === 1 && ((haveEasy && easy.length === 1) || (haveHard && hard.length === 1) || (haveOpened && opened.length === 1)) ? '' : 's'}.</div>`;
     } else {
-      statusHtml = '<div class="cn-status-line cn-status-waiting">Waiting for the page to call fetchpuzzles… (happens automatically on page load — no action needed)</div>';
+      statusHtml = '<div class="cn-status-line cn-status-waiting">Waiting for the page to call fetchpuzzles or /puzzle…</div>';
     }
 
-    body.innerHTML = statusHtml + renderPuzzleSections(easy || [], hard || [], sectionCollapsed);
+    body.innerHTML = statusHtml + renderPuzzleSections(
+      easy || [],
+      hard || [],
+      opened,
+      sectionCollapsed
+    );
 
-    // innerHTML replacement wipes any previously attached listeners, so
-    // (re-)wire the per-section Copy/Download/collapse controls every render.
+    // innerHTML replacement wipes listeners, so rewire every render.
     body.querySelectorAll('.cn-copy-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
-        const list = capturedPuzzles[btn.dataset.key] || [];
-        navigator.clipboard.writeText(puzzlesToPgn(list, btn.dataset.key))
-          .then(() => LOG(`Copy (${btn.dataset.key}): copied to clipboard`))
-          .catch((e) => LOG_ERR(`Copy (${btn.dataset.key}): failed`, e));
+        const key = btn.dataset.key;
+        const list = capturedPuzzles[key] || [];
+        navigator.clipboard.writeText(sectionToPgn(key, list))
+          .then(() => LOG(`Copy (${key}): copied to clipboard`))
+          .catch((e) => LOG_ERR(`Copy (${key}): failed`, e));
       });
     });
+
     body.querySelectorAll('.cn-download-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
-        const list = capturedPuzzles[btn.dataset.key] || [];
-        downloadText(`chessneurons-${btn.dataset.key.toLowerCase()}.pgn`, puzzlesToPgn(list, btn.dataset.key));
+        const key = btn.dataset.key;
+        const list = capturedPuzzles[key] || [];
+        downloadText(
+          `chessneurons-${key.toLowerCase()}.pgn`,
+          sectionToPgn(key, list)
+        );
       });
     });
+
     body.querySelectorAll('.cn-section-toggle').forEach((el) => {
       el.addEventListener('click', () => {
         const key = el.dataset.toggleKey;
@@ -441,19 +678,26 @@
   }
 
   function makeDraggable(panel, handle) {
-    let offsetX = 0, offsetY = 0, dragging = false;
+    let offsetX = 0;
+    let offsetY = 0;
+    let dragging = false;
+
     handle.addEventListener('mousedown', (e) => {
       dragging = true;
       offsetX = e.clientX - panel.offsetLeft;
       offsetY = e.clientY - panel.offsetTop;
     });
+
     document.addEventListener('mousemove', (e) => {
       if (!dragging) return;
       panel.style.left = `${e.clientX - offsetX}px`;
       panel.style.top = `${e.clientY - offsetY}px`;
       panel.style.right = 'auto';
     });
-    document.addEventListener('mouseup', () => { dragging = false; });
+
+    document.addEventListener('mouseup', () => {
+      dragging = false;
+    });
   }
 
   function buildPanel() {
@@ -469,6 +713,7 @@
       </div>
       <div id="cn-pgn-panel-body"></div>
     `;
+
     document.body.appendChild(panel);
     LOG('buildPanel: panel appended to document.body');
 
@@ -476,8 +721,6 @@
     const body = panel.querySelector('#cn-pgn-panel-body');
     makeDraggable(panel, header);
 
-    // Live-update the panel whenever passive capture picks up new data,
-    // without ever firing a request ourselves.
     const onCapture = () => renderPanelBody(body);
     captureListeners.push(onCapture);
 
@@ -497,29 +740,33 @@
       LOG('showToggleButton: button already exists, skipping creation');
       return;
     }
+
     LOG('showToggleButton: creating toggle button');
     btn = document.createElement('button');
     btn.id = 'cn-pgn-toggle';
     updateToggleButtonState(btn);
+
     btn.addEventListener('click', () => {
       if (btn.disabled) return;
       btn.remove();
       buildPanel();
     });
+
     document.body.appendChild(btn);
-    LOG('showToggleButton: button appended to document.body — should be visible now');
+    LOG('showToggleButton: button appended to document.body');
   }
 
   function updateToggleButtonState(btn) {
-    const captured = Array.isArray(capturedPuzzles.EASY) && Array.isArray(capturedPuzzles.HARD);
+    const captured = Array.isArray(capturedPuzzles.EASY)
+      || Array.isArray(capturedPuzzles.HARD)
+      || capturedPuzzles.OPENED.length > 0;
+
     btn.disabled = !captured;
     btn.textContent = captured
       ? 'Show Decrypted PGNs'
       : 'Waiting for puzzles…';
   }
 
-  // Keep the toggle button's enabled/disabled state in sync with capture,
-  // even if the button was created before capture completed.
   captureListeners.push(() => {
     const btn = document.getElementById('cn-pgn-toggle');
     if (btn) updateToggleButtonState(btn);
@@ -532,6 +779,7 @@
         LOG('init: document.body not ready yet, will retry on next trigger');
         return false;
       }
+
       injectStyles();
       showToggleButton();
       LOG('init: completed successfully');
@@ -544,13 +792,11 @@
 
   LOG('reached end of setup, readyState =', document.readyState);
 
-  // Belt-and-suspenders startup: React SPAs and userscript sandboxes make
-  // it hard to guarantee any single lifecycle event fires after this script
-  // attaches its listener, so try every trigger and also poll as a backstop.
   document.addEventListener('DOMContentLoaded', () => {
     LOG('DOMContentLoaded fired');
     init();
   });
+
   window.addEventListener('load', () => {
     LOG('window load fired');
     init();
@@ -570,6 +816,7 @@
       clearInterval(pollId);
     }
   }, 500);
+
   setTimeout(() => {
     clearInterval(pollId);
     LOG('poll: stopped after 20s timeout');
