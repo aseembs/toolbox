@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Chessable PGN Exporter & Auto-Next
+// @name         Chessable PGN Exporter
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  Export Chessable games to PGN format, downloads, and clicks Next automatically.
+// @version      4.0
+// @description  Intercepts and exports annotated PGNs (with FEN). Features auto-download, sequential file numbering, and auto-advancing.
 // @author       Aseem Sharan
 // @match        https://www.chessable.com/*
 // @grant        none
@@ -16,7 +16,34 @@
     let currentGameData = null;
     let isAutoDownload = true;
 
-    // --- PGN PARSING LOGIC ---
+    // --- STORAGE FOR SEED AND COUNTER ---
+    function getConfig() {
+        return {
+            seed: localStorage.getItem('chessable_dl_seed') || '1',
+            counter: parseInt(localStorage.getItem('chessable_dl_counter') || '1', 10)
+        };
+    }
+
+    function setConfig(seed, counter) {
+        localStorage.setItem('chessable_dl_seed', seed);
+        localStorage.setItem('chessable_dl_counter', counter.toString());
+
+        const seedInput = document.getElementById('chessable-seed-input');
+        const counterInput = document.getElementById('chessable-counter-input');
+        if (seedInput) seedInput.value = seed;
+        if (counterInput) counterInput.value = counter;
+    }
+
+    // --- NEW: FEN CHECKER ---
+    function isStandardStartPosition(fen) {
+        if (!fen) return true;
+        const standardFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+        const fenParts = fen.trim().split(/\s+/);
+        const stdParts = standardFen.split(' ');
+        return fenParts[0] === stdParts[0] && (fenParts[1] === undefined || fenParts[1] === stdParts[1]);
+    }
+
+    // --- PGN PARSING LOGIC (UPGRADED FEN v2) ---
     function extractCommentary(afterData) {
         if (!afterData || !afterData.data) return "";
         const comments = [];
@@ -46,9 +73,7 @@
                         nestedParts.push(itemVal);
                     }
                 }
-                if (nestedParts.length > 0) {
-                    comments.push(nestedParts.join(' '));
-                }
+                if (nestedParts.length > 0) comments.push(nestedParts.join(' '));
             }
         }
         return comments.join(' ');
@@ -65,20 +90,6 @@
         return "";
     }
 
-    /**
-     * Check if a FEN string represents the standard starting position
-     */
-    function isStandardStartPosition(fen) {
-        if (!fen) return true;
-        const standardFen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
-        const fenParts = fen.trim().split(/\s+/);
-        const stdParts = standardFen.split(' ');
-        return fenParts[0] === stdParts[0] && (fenParts[1] === undefined || fenParts[1] === stdParts[1]);
-    }
-
-    /**
-     * Convert game data to PGN format (Using v1.3 Token Logic)
-     */
     function convertToPGN(gameData) {
         const gameInfo = gameData.game || {};
         const moves = gameInfo.data || [];
@@ -95,26 +106,20 @@
             const san = move.san || '';
             const col = move.col || '';
             const ann1 = (move.ann1 || '').trim();
-
             const beforeComment = extractBeforeCommentary(move);
-
             let afterComment = "";
             const afterField = move.after || '';
+
             if (afterField && typeof afterField === 'string') {
                 try {
                     const afterData = JSON.parse(afterField);
                     const commentText = extractCommentary(afterData);
-                    if (commentText) {
-                        afterComment = commentText;
-                    }
+                    if (commentText) afterComment = commentText;
                 } catch (e) {}
             }
 
             if (col === 'w') {
-                if (beforeComment) {
-                    tokens.push(`{${beforeComment}}`);
-                }
-
+                if (beforeComment) tokens.push(`{${beforeComment}}`);
                 if (san) {
                     whiteMove = san;
                     whiteAnnotation = ann1;
@@ -124,18 +129,15 @@
                     whiteAnnotation = "";
                     whiteAfterComment = "";
                 }
-
             } else if (col === 'b') {
                 if (whiteMove) {
                     tokens.push(`${moveNum}. ${whiteMove}${whiteAnnotation}`);
                     if (whiteAfterComment) tokens.push(whiteAfterComment);
                     if (beforeComment) tokens.push(`{${beforeComment}}`);
-
                     if (san) {
                         tokens.push(`${san}${ann1}`);
                         if (afterComment) tokens.push(`{${afterComment}}`);
                     }
-
                     moveNum++;
                     whiteMove = "";
                     whiteAnnotation = "";
@@ -190,12 +192,7 @@
     // --- UI & NOTIFICATIONS ---
     function showNotification(message, type = 'success') {
         const toast = document.createElement('div');
-        toast.style.cssText = `
-            position: fixed; top: 70px; right: 10px; z-index: 10001; padding: 12px 20px;
-            background-color: ${type === 'success' ? '#4CAF50' : type === 'error' ? '#f44336' : '#ff9800'};
-            color: white; border-radius: 5px; font-size: 14px; font-weight: bold;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.3); animation: slideIn 0.3s ease-out;
-        `;
+        toast.style.cssText = `position: fixed; top: 70px; right: 10px; z-index: 10001; padding: 12px 20px; background-color: ${type === 'success' ? '#4CAF50' : type === 'error' ? '#f44336' : '#ff9800'}; color: white; border-radius: 5px; font-size: 14px; font-weight: bold; box-shadow: 0 2px 5px rgba(0,0,0,0.3); animation: slideIn 0.3s ease-out;`;
         toast.textContent = message;
         document.body.appendChild(toast);
         setTimeout(() => {
@@ -216,18 +213,17 @@
         }
     }
 
-    // --- AUTO NEXT FUNCTION ---
     function clickNextPage() {
         const nextButton = document.getElementById('variation-btn-next-variation');
         if (nextButton) {
             showNotification('Moving to Next Variation...', 'warning');
-            setTimeout(() => nextButton.click(), 1000); // 1 sec delay to let download finish
+            setTimeout(() => nextButton.click(), 1000);
         } else {
             console.log("Auto-Next: Button not found.");
         }
     }
 
-    // --- DOWNLOAD WORKFLOW ---
+    // --- DOWNLOAD WORKFLOW (WITH AUTO-NUMBERING) ---
     function downloadPGN() {
         if (!currentGameData) {
             showNotification('No game data available.', 'error');
@@ -235,11 +231,15 @@
         }
 
         try {
+            const config = getConfig();
             const pgn = convertToPGN(currentGameData);
             const gameInfo = currentGameData.game || {};
-            const lineName = gameInfo.lineName || 'game';
+            const lineName = gameInfo.lineName || '';
             const title = gameInfo.title || 'game';
-            const filename = lineName + ' - ' + title + '.pgn';
+
+            let baseName = (lineName ? lineName + ' - ' : '') + title;
+            let cleanName = baseName.replace(/^([0-9]+[a-zA-Z\s\.]*)\)\s*/, '');
+            const filename = `${config.seed}.${config.counter}) ${cleanName}.pgn`;
 
             const blob = new Blob([pgn], { type: 'text/plain' });
             const url = URL.createObjectURL(blob);
@@ -253,7 +253,8 @@
 
             showNotification(`✓ Downloaded: ${filename}`, 'success');
 
-            // NEW: Automatically trigger the next page click after a successful download
+            setConfig(config.seed, config.counter + 1);
+
             if (isAutoDownload) {
                 setTimeout(clickNextPage, 1000);
             }
@@ -328,21 +329,50 @@
 
     function addButtons() {
         if (document.getElementById('chessable-pgn-export-btn')) return;
+
+        const config = getConfig();
         const container = document.createElement('div');
-        container.style.cssText = `position: fixed; top: 10px; right: 10px; z-index: 10000; display: flex; gap: 10px;`;
+        container.style.cssText = `position: fixed; top: 10px; right: 10px; z-index: 10000; display: flex; gap: 8px; align-items: center; background: rgba(255,255,255,0.9); padding: 5px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.2);`;
+
+        const seedContainer = document.createElement('div');
+        seedContainer.innerHTML = `<span style="font-size: 12px; font-weight: bold; color: #333; margin-right: 4px;">Seed:</span>`;
+        const seedInput = document.createElement('input');
+        seedInput.id = 'chessable-seed-input';
+        seedInput.type = 'text';
+        seedInput.value = config.seed;
+        seedInput.style.cssText = `width: 40px; padding: 5px; border-radius: 4px; border: 1px solid #ccc; text-align: center; font-weight: bold;`;
+        seedInput.addEventListener('change', (e) => {
+            setConfig(e.target.value, 1);
+            showNotification(`Seed set to ${e.target.value}. Counter reset to 1.`, 'success');
+        });
+        seedContainer.appendChild(seedInput);
+
+        const counterContainer = document.createElement('div');
+        counterContainer.innerHTML = `<span style="font-size: 12px; font-weight: bold; color: #333; margin-right: 4px;">Ct:</span>`;
+        const counterInput = document.createElement('input');
+        counterInput.id = 'chessable-counter-input';
+        counterInput.type = 'number';
+        counterInput.value = config.counter;
+        counterInput.style.cssText = `width: 40px; padding: 5px; border-radius: 4px; border: 1px solid #ccc; text-align: center; font-weight: bold;`;
+        counterInput.addEventListener('change', (e) => {
+            setConfig(getConfig().seed, parseInt(e.target.value, 10));
+        });
+        counterContainer.appendChild(counterInput);
 
         const dlButton = document.createElement('button');
         dlButton.id = 'chessable-pgn-export-btn';
         dlButton.textContent = '📥 No Data';
-        dlButton.style.cssText = `padding: 10px 15px; background-color: #9E9E9E; color: white; border: none; border-radius: 5px; font-size: 14px; font-weight: bold; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: background-color 0.3s;`;
+        dlButton.style.cssText = `padding: 8px 12px; background-color: #9E9E9E; color: white; border: none; border-radius: 5px; font-size: 13px; font-weight: bold; cursor: pointer; transition: background-color 0.3s;`;
         dlButton.onclick = downloadPGN;
 
         const toggleBtn = document.createElement('button');
         toggleBtn.id = 'chessable-auto-dl-btn';
         toggleBtn.textContent = '🔄 Auto: ON';
-        toggleBtn.style.cssText = `padding: 10px 15px; background-color: #007bff; color: white; border: none; border-radius: 5px; font-size: 14px; font-weight: bold; cursor: pointer; box-shadow: 0 2px 5px rgba(0,0,0,0.2); transition: background-color 0.3s;`;
+        toggleBtn.style.cssText = `padding: 8px 12px; background-color: #007bff; color: white; border: none; border-radius: 5px; font-size: 13px; font-weight: bold; cursor: pointer; transition: background-color 0.3s;`;
         toggleBtn.onclick = toggleAutoDownload;
 
+        container.appendChild(seedContainer);
+        container.appendChild(counterContainer);
         container.appendChild(dlButton);
         container.appendChild(toggleBtn);
         document.body.appendChild(container);
